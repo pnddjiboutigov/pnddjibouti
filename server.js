@@ -1,15 +1,17 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { z } from "zod";
 import bcrypt from "bcryptjs";
 import { SignJWT, jwtVerify } from "jose";
-import { eq, and, gte, lte, desc, sql } from "drizzle-orm";
+import { eq, and, gte, lte, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { serial, pgTable, varchar, text, timestamp, integer, boolean, real } from "drizzle-orm/pg-core";
+import {
+  serial, pgTable, varchar, text, timestamp,
+  integer, boolean, real
+} from "drizzle-orm/pg-core";
 
-// ==================== DATABASE SCHEMA ====================
+// ============ DATABASE SCHEMA ============
 const stations = pgTable("stations", {
   id: serial("id").primaryKey(),
   name: varchar("name", { length: 100 }).notNull(),
@@ -72,7 +74,6 @@ const reports = pgTable("reports", {
   submittedAt: timestamp("submitted_at").defaultNow(),
   approvedAt: timestamp("approved_at"),
   approvedBy: varchar("approved_by", { length: 50 }),
-  syncStatus: varchar("sync_status", { length: 20 }).default("synced"),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
@@ -153,151 +154,457 @@ const auditLog = pgTable("audit_log", {
   createdAt: timestamp("created_at").defaultNow(),
 });
 
-const schema = { stations, vehicleTypes, insuranceCompanies, officers, reports, vehicles, persons, witnesses, photos, videos, measurements, auditLog };
+const allSchema = {
+  stations, vehicleTypes, insuranceCompanies,
+  officers, reports, vehicles, persons,
+  witnesses, photos, videos, measurements, auditLog
+};
 
-// ==================== DATABASE CONNECTION ====================
+// ============ DATABASE CONNECTION ============
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  ssl: process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : false,
 });
-const db = drizzle(pool, { schema });
 
-const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "pnd-djibouti-secret-key-2026");
+const db = drizzle(pool, { schema: allSchema });
+const JWT_SECRET = new TextEncoder().encode(
+  process.env.JWT_SECRET || "pnd-djibouti-secret-key-2026"
+);
 
-// ==================== APP ====================
+// ============ APP SETUP ============
 const app = new Hono();
-app.use("*", cors({ origin: "*", allowMethods: ["GET","POST","PUT","DELETE","OPTIONS"], allowHeaders: ["*"] }));
+app.use("*", cors({
+  origin: "*",
+  allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowHeaders: ["*"],
+}));
 
-// Auth middleware
+// ============ AUTH MIDDLEWARE ============
 const authMiddleware = async (c, next) => {
   const token = c.req.header("Authorization")?.replace("Bearer ", "");
   if (!token) return c.json({ error: "Unauthorized" }, 401);
   try {
-    const { payload } = await jwtVerify(token, JWT_SECRET, { clockTolerance: 60 });
+    const { payload } = await jwtVerify(token, JWT_SECRET, {
+      clockTolerance: 60,
+    });
     c.set("user", payload);
     await next();
-  } catch { return c.json({ error: "Invalid token" }, 401); }
+  } catch {
+    return c.json({ error: "Invalid token" }, 401);
+  }
 };
 
 const adminMiddleware = async (c, next) => {
   const user = c.get("user");
-  if (!user || user.rank !== "admin") return c.json({ error: "Admin only" }, 403);
+  if (!user || user.rank !== "admin") {
+    return c.json({ error: "Admin only" }, 403);
+  }
   await next();
 };
 
-// Audit helper
-async function audit(action, resource, resourceId, details, userId) {
-  try { await db.insert(auditLog).values({ action, resource, resourceId, details, userId: String(userId) }); } catch(e) {}
+// ============ HELPERS ============
+async function addAudit(action, resource, resourceId, details, userId) {
+  try {
+    await db.insert(auditLog).values({
+      action, resource, resourceId, details,
+      userId: String(userId),
+    });
+  } catch (e) {
+    console.error("Audit error:", e.message);
+  }
 }
 
-// ==================== AUTH ====================
+// ============ AUTH ENDPOINTS ============
 app.post("/api/auth/officer-login", async (c) => {
   const { badgeNumber, authCode } = await c.req.json();
-  if (!badgeNumber || !authCode) return c.json({ error: "Missing credentials" }, 400);
-  const off = await db.select().from(officers).where(eq(officers.badgeNumber, badgeNumber)).limit(1);
-  if (!off.length) return c.json({ error: "Invalid credentials" }, 401);
+  if (!badgeNumber || !authCode) {
+    return c.json({ error: "Missing credentials" }, 400);
+  }
+
+  const off = await db.select().from(officers)
+    .where(eq(officers.badgeNumber, badgeNumber))
+    .limit(1);
+
+  if (!off.length) {
+    return c.json({ error: "Invalid credentials" }, 401);
+  }
+
   const match = await bcrypt.compare(authCode, off[0].authCode);
   if (!match) return c.json({ error: "Invalid credentials" }, 401);
-  const st = await db.select().from(stations).where(eq(stations.id, off[0].stationId)).limit(1);
-  const token = await new SignJWT({ officerId: off[0].id, badge: off[0].badgeNumber, rank: off[0].rank, name: off[0].firstName + " " + off[0].lastName, station: st[0]?.name || "" }).setProtectedHeader({ alg: "HS256" }).setExpirationTime("7d").sign(JWT_SECRET);
-  await audit("login", "officer", String(off[0].id), "Officer " + off[0].badgeNumber + " logged in", String(off[0].id));
-  return c.json({ token, officer: { ...off[0], stationName: st[0]?.name || "" } });
+
+  const st = await db.select().from(stations)
+    .where(eq(stations.id, off[0].stationId))
+    .limit(1);
+
+  const token = await new SignJWT({
+    officerId: off[0].id,
+    badge: off[0].badgeNumber,
+    rank: off[0].rank,
+    name: off[0].firstName + " " + off[0].lastName,
+    station: st[0]?.name || "",
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setExpirationTime("7d")
+    .sign(JWT_SECRET);
+
+  await addAudit("login", "officer", String(off[0].id),
+    "Officer " + off[0].badgeNumber + " logged in",
+    String(off[0].id));
+
+  return c.json({
+    token,
+    officer: { ...off[0], stationName: st[0]?.name || "" },
+  });
 });
 
 app.post("/api/auth/admin-login", async (c) => {
   const { password } = await c.req.json();
-  if (password !== "admin2025") return c.json({ error: "Invalid password" }, 401);
-  const token = await new SignJWT({ badge: "ADMIN", rank: "admin", name: "Administrator" }).setProtectedHeader({ alg: "HS256" }).setExpirationTime("7d").sign(JWT_SECRET);
+  if (password !== "admin2025") {
+    return c.json({ error: "Invalid password" }, 401);
+  }
+  const token = await new SignJWT({
+    badge: "ADMIN", rank: "admin", name: "Administrator",
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setExpirationTime("7d")
+    .sign(JWT_SECRET);
+
   return c.json({ token });
 });
 
-// ==================== STATIONS ====================
-app.get("/api/stations", async (c) => { const d = await db.select().from(stations).where(eq(stations.active, true)); return c.json(d); });
+// ============ STATIONS ============
+app.get("/api/stations", async (c) => {
+  const data = await db.select().from(stations)
+    .where(eq(stations.active, true));
+  return c.json(data);
+});
 
-// ==================== VEHICLE TYPES ====================
-app.get("/api/vehicle-types", async (c) => { const d = await db.select().from(vehicleTypes).where(eq(vehicleTypes.active, true)); return c.json(d); });
-app.post("/api/vehicle-types", authMiddleware, adminMiddleware, async (c) => { const b = await c.req.json(); const r = await db.insert(vehicleTypes).values(b).returning(); return c.json(r[0]); });
-app.put("/api/vehicle-types/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); const b = await c.req.json(); const r = await db.update(vehicleTypes).set(b).where(eq(vehicleTypes.id, id)).returning(); return c.json(r[0]); });
-app.delete("/api/vehicle-types/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); await db.update(vehicleTypes).set({ active: false }).where(eq(vehicleTypes.id, id)); return c.json({ success: true }); });
+// ============ VEHICLE TYPES ============
+app.get("/api/vehicle-types", async (c) => {
+  const data = await db.select().from(vehicleTypes)
+    .where(eq(vehicleTypes.active, true));
+  return c.json(data);
+});
 
-// ==================== INSURANCE COMPANIES ====================
-app.get("/api/insurance-companies", async (c) => { const d = await db.select().from(insuranceCompanies).where(eq(insuranceCompanies.active, true)); return c.json(d); });
-app.post("/api/insurance-companies", authMiddleware, adminMiddleware, async (c) => { const b = await c.req.json(); const r = await db.insert(insuranceCompanies).values(b).returning(); return c.json(r[0]); });
-app.put("/api/insurance-companies/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); const b = await c.req.json(); const r = await db.update(insuranceCompanies).set(b).where(eq(insuranceCompanies.id, id)).returning(); return c.json(r[0]); });
-app.delete("/api/insurance-companies/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); await db.update(insuranceCompanies).set({ active: false }).where(eq(insuranceCompanies.id, id)); return c.json({ success: true }); });
+app.post("/api/vehicle-types", authMiddleware, adminMiddleware,
+  async (c) => {
+    const body = await c.req.json();
+    const result = await db.insert(vehicleTypes).values(body).returning();
+    return c.json(result[0]);
+  }
+);
 
-// ==================== OFFICERS ====================
-app.get("/api/officers", authMiddleware, async (c) => { const d = await db.select().from(officers).orderBy(desc(officers.createdAt)); const st = await db.select().from(stations); const enriched = d.map(o => ({ ...o, stationName: st.find(s => s.id === o.stationId)?.name || "" })); return c.json(enriched); });
-app.post("/api/officers", authMiddleware, adminMiddleware, async (c) => { const b = await c.req.json(); const hc = await bcrypt.hash(b.authCode, 10); const r = await db.insert(officers).values({ ...b, authCode: hc }).returning(); await audit("create_officer", "officer", String(r[0].id), "Officer " + b.badgeNumber + " created", "admin"); return c.json({ ...r[0], authCode: undefined }); });
-app.put("/api/officers/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); const b = await c.req.json(); const ud = { ...b }; if (b.authCode) ud.authCode = await bcrypt.hash(b.authCode, 10); const r = await db.update(officers).set(ud).where(eq(officers.id, id)).returning(); return c.json({ ...r[0], authCode: undefined }); });
-app.delete("/api/officers/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); await db.update(officers).set({ status: "inactive" }).where(eq(officers.id, id)); return c.json({ success: true }); });
+// ============ INSURANCE COMPANIES ============
+app.get("/api/insurance-companies", async (c) => {
+  const data = await db.select().from(insuranceCompanies)
+    .where(eq(insuranceCompanies.active, true));
+  return c.json(data);
+});
 
-// ==================== REPORTS ====================
-app.get("/api/reports", authMiddleware, async (c) => { const d = await db.select().from(reports).orderBy(desc(reports.createdAt)); const o = await db.select().from(officers); const enriched = d.map(r => ({ ...r, officerName: o.find(x => x.id === r.officerId)?.firstName + " " + o.find(x => x.id === r.officerId)?.lastName || "" })); return c.json(enriched); });
+app.post("/api/insurance-companies", authMiddleware, adminMiddleware,
+  async (c) => {
+    const body = await c.req.json();
+    const result = await db.insert(insuranceCompanies)
+      .values(body).returning();
+    return c.json(result[0]);
+  }
+);
+
+// ============ OFFICERS ============
+app.get("/api/officers", authMiddleware, async (c) => {
+  const data = await db.select().from(officers)
+    .orderBy(desc(officers.createdAt));
+  const stList = await db.select().from(stations);
+  const enriched = data.map(o => ({
+    ...o,
+    stationName: stList.find(s => s.id === o.stationId)?.name || "",
+  }));
+  return c.json(enriched);
+});
+
+app.post("/api/officers", authMiddleware, adminMiddleware,
+  async (c) => {
+    const body = await c.req.json();
+    const hashed = await bcrypt.hash(body.authCode, 10);
+    const result = await db.insert(officers).values({
+      ...body, authCode: hashed,
+    }).returning();
+    await addAudit("create_officer", "officer",
+      String(result[0].id),
+      "Officer " + body.badgeNumber + " created", "admin");
+    return c.json({ ...result[0], authCode: undefined });
+  }
+);
+
+app.delete("/api/officers/:id", authMiddleware, adminMiddleware,
+  async (c) => {
+    const id = parseInt(c.req.param("id"));
+    await db.update(officers).set({ status: "inactive" })
+      .where(eq(officers.id, id));
+    return c.json({ success: true });
+  }
+);
+
+// ============ REPORTS ============
+app.get("/api/reports", authMiddleware, async (c) => {
+  const data = await db.select().from(reports)
+    .orderBy(desc(reports.createdAt));
+  const offList = await db.select().from(officers);
+  const enriched = data.map(r => ({
+    ...r,
+    officerName: offList.find(o => o.id === r.officerId)
+      ? offList.find(o => o.id === r.officerId).firstName
+        + " " + offList.find(o => o.id === r.officerId).lastName
+      : "",
+  }));
+  return c.json(enriched);
+});
 
 app.get("/api/reports/:id/full", authMiddleware, async (c) => {
   const rid = parseInt(c.req.param("id"));
-  const rp = await db.select().from(reports).where(eq(reports.id, rid)).limit(1);
+  const rp = await db.select().from(reports)
+    .where(eq(reports.id, rid)).limit(1);
   if (!rp.length) return c.json({ error: "Not found" }, 404);
+
   const [v, p, w, ph, vi, m] = await Promise.all([
     db.select().from(vehicles).where(eq(vehicles.reportId, rid)),
     db.select().from(persons).where(eq(persons.reportId, rid)),
     db.select().from(witnesses).where(eq(witnesses.reportId, rid)),
     db.select().from(photos).where(eq(photos.reportId, rid)),
     db.select().from(videos).where(eq(videos.reportId, rid)),
-    db.select().from(measurements).where(eq(measurements.reportId, rid)),
+    db.select().from(measurements)
+      .where(eq(measurements.reportId, rid)),
   ]);
-  const o = await db.select().from(officers).where(eq(officers.id, rp[0].officerId)).limit(1);
-  const st = o.length ? await db.select().from(stations).where(eq(stations.id, o[0].stationId)).limit(1) : [];
-  return c.json({ ...rp[0], vehicles: v, persons: p, witnesses: w, photos: ph, videos: vi, measurements: m, officer: o.length ? { ...o[0], stationName: st[0]?.name || "" } : null });
+
+  const o = await db.select().from(officers)
+    .where(eq(officers.id, rp[0].officerId)).limit(1);
+  const st = o.length
+    ? await db.select().from(stations)
+      .where(eq(stations.id, o[0].stationId)).limit(1)
+    : [];
+
+  return c.json({
+    ...rp[0],
+    vehicles: v,
+    persons: p,
+    witnesses: w,
+    photos: ph,
+    videos: vi,
+    measurements: m,
+    officer: o.length
+      ? { ...o[0], stationName: st[0]?.name || "" }
+      : null,
+  });
 });
 
 app.post("/api/reports", authMiddleware, async (c) => {
-  const b = await c.req.json();
-  const u = c.get("user");
-  const rd = { reportId: b.reportId || ("RPT-" + new Date().toISOString().slice(0,10).replace(/-/g,"") + "-" + String(Math.floor(Math.random()*9000)+1000)), officerId: u.officerId || 1, status: b.status || "submitted", address: b.address || b.location?.address || "", latitude: b.latitude || b.location?.latitude || null, longitude: b.longitude || b.location?.longitude || null, date: b.date || new Date().toISOString().slice(0,10), time: b.time || new Date().toTimeString().slice(0,5), accidentType: b.accidentType || "", severity: b.severity || "moderate", weather: b.weather || "", roadCondition: b.roadCondition || "", lighting: b.lighting || "", description: b.description || "", damageDescription: b.damageDescription || "", officerObservations: b.officerObservations || "", evidenceNotes: b.evidenceNotes || "", syncStatus: "synced" };
-  const r = await db.insert(reports).values(rd).returning();
-  const nid = r[0].id;
-  if (b.vehicles?.length) for (const x of b.vehicles) await db.insert(vehicles).values({ reportId: nid, ...x });
-  if (b.parties?.length) for (const x of b.parties) await db.insert(persons).values({ reportId: nid, ...x });
-  if (b.witnesses?.length) for (const x of b.witnesses) await db.insert(witnesses).values({ reportId: nid, ...x });
-  if (b.photos?.length) for (const x of b.photos) await db.insert(photos).values({ reportId: nid, ...x });
-  if (b.videos?.length) for (const x of b.videos) await db.insert(videos).values({ reportId: nid, ...x });
-  if (b.measurements?.length) for (const x of b.measurements) await db.insert(measurements).values({ reportId: nid, ...x });
-  await audit("submit_report", "report", String(nid), "Report " + rd.reportId + " submitted", String(u.officerId || 1));
-  return c.json({ ...r[0], id: nid });
+  const body = await c.req.json();
+  const user = c.get("user");
+
+  const reportData = {
+    reportId: body.reportId || "RPT-"
+      + new Date().toISOString().slice(0, 10).replace(/-/g, "")
+      + "-" + String(Math.floor(Math.random() * 9000) + 1000),
+    officerId: user.officerId || 1,
+    status: body.status || "submitted",
+    address: body.address || body.location?.address || "",
+    latitude: body.latitude || body.location?.latitude || null,
+    longitude: body.longitude || body.location?.longitude || null,
+    date: body.date || new Date().toISOString().slice(0, 10),
+    time: body.time || new Date().toTimeString().slice(0, 5),
+    accidentType: body.accidentType || "",
+    severity: body.severity || "moderate",
+    weather: body.weather || "",
+    roadCondition: body.roadCondition || "",
+    lighting: body.lighting || "",
+    description: body.description || "",
+    damageDescription: body.damageDescription || "",
+    officerObservations: body.officerObservations || "",
+    evidenceNotes: body.evidenceNotes || "",
+  };
+
+  const result = await db.insert(reports).values(reportData)
+    .returning();
+  const newId = result[0].id;
+
+  if (body.vehicles?.length) {
+    for (const x of body.vehicles) {
+      await db.insert(vehicles).values({ reportId: newId, ...x });
+    }
+  }
+  if (body.parties?.length) {
+    for (const x of body.parties) {
+      await db.insert(persons).values({ reportId: newId, ...x });
+    }
+  }
+  if (body.witnesses?.length) {
+    for (const x of body.witnesses) {
+      await db.insert(witnesses).values({ reportId: newId, ...x });
+    }
+  }
+  if (body.photos?.length) {
+    for (const x of body.photos) {
+      await db.insert(photos).values({ reportId: newId, ...x });
+    }
+  }
+  if (body.videos?.length) {
+    for (const x of body.videos) {
+      await db.insert(videos).values({ reportId: newId, ...x });
+    }
+  }
+  if (body.measurements?.length) {
+    for (const x of body.measurements) {
+      await db.insert(measurements)
+        .values({ reportId: newId, ...x });
+    }
+  }
+
+  await addAudit("submit_report", "report", String(newId),
+    "Report " + reportData.reportId + " submitted",
+    String(user.officerId || 1));
+
+  return c.json({ ...result[0], id: newId });
 });
 
-app.put("/api/reports/:id", authMiddleware, async (c) => { const id = parseInt(c.req.param("id")); const b = await c.req.json(); const ud = { ...b, updatedAt: new Date() }; delete ud.vehicles; delete ud.persons; delete ud.witnesses; delete ud.photos; delete ud.videos; delete ud.measurements; const r = await db.update(reports).set(ud).where(eq(reports.id, id)).returning(); return c.json(r[0]); });
+app.post("/api/reports/:id/approve", authMiddleware, adminMiddleware,
+  async (c) => {
+    const id = parseInt(c.req.param("id"));
+    const result = await db.update(reports).set({
+      status: "approved",
+      approvedAt: new Date(),
+      approvedBy: "admin",
+    }).where(eq(reports.id, id)).returning();
 
-app.post("/api/reports/:id/approve", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); const r = await db.update(reports).set({ status: "approved", approvedAt: new Date(), approvedBy: "admin" }).where(eq(reports.id, id)).returning(); await audit("approve_report", "report", String(id), "Report " + r[0].reportId + " approved", "admin"); return c.json(r[0]); });
+    await addAudit("approve_report", "report", String(id),
+      "Report " + result[0].reportId + " approved", "admin");
+    return c.json(result[0]);
+  }
+);
 
-app.delete("/api/reports/:id", authMiddleware, adminMiddleware, async (c) => { const id = parseInt(c.req.param("id")); await db.delete(vehicles).where(eq(vehicles.reportId, id)); await db.delete(persons).where(eq(persons.reportId, id)); await db.delete(witnesses).where(eq(witnesses.reportId, id)); await db.delete(photos).where(eq(photos.reportId, id)); await db.delete(videos).where(eq(videos.reportId, id)); await db.delete(measurements).where(eq(measurements.reportId, id)); await db.delete(reports).where(eq(reports.id, id)); return c.json({ success: true }); });
+app.delete("/api/reports/:id", authMiddleware, adminMiddleware,
+  async (c) => {
+    const id = parseInt(c.req.param("id"));
+    await db.delete(vehicles).where(eq(vehicles.reportId, id));
+    await db.delete(persons).where(eq(persons.reportId, id));
+    await db.delete(witnesses).where(eq(witnesses.reportId, id));
+    await db.delete(photos).where(eq(photos.reportId, id));
+    await db.delete(videos).where(eq(videos.reportId, id));
+    await db.delete(measurements)
+      .where(eq(measurements.reportId, id));
+    await db.delete(reports).where(eq(reports.id, id));
+    return c.json({ success: true });
+  }
+);
 
-// ==================== PERIOD REPORTS ====================
-app.get("/api/reports/period/:period", authMiddleware, async (c) => {
-  const period = c.req.param("period");
-  const now = new Date(); let startDate, endDate;
-  if (period === "daily") { startDate = endDate = now.toISOString().slice(0,10); }
-  else if (period === "weekly") { const d = new Date(now); d.setDate(d.getDate() - 7); startDate = d.toISOString().slice(0,10); endDate = now.toISOString().slice(0,10); }
-  else if (period === "monthly") { startDate = now.toISOString().slice(0,8) + "01"; endDate = now.toISOString().slice(0,10); }
-  else if (period === "quarterly") { const q = Math.floor(now.getMonth() / 3); startDate = now.getFullYear() + "-" + String(q*3+1).padStart(2,"0") + "-01"; endDate = now.toISOString().slice(0,10); }
-  else if (period === "yearly") { startDate = now.getFullYear() + "-01-01"; endDate = now.toISOString().slice(0,10); }
-  else return c.json({ error: "Invalid period" }, 400);
-  const rp = await db.select().from(reports).where(and(gte(reports.date, startDate), lte(reports.date, endDate))).orderBy(desc(reports.date));
-  const s = { total: rp.length, minor: rp.filter(r => r.severity === "minor").length, moderate: rp.filter(r => r.severity === "moderate").length, serious: rp.filter(r => r.severity === "serious").length, fatal: rp.filter(r => r.severity === "fatal").length, byType: {}, byWeather: {}, byRoad: {} };
-  rp.forEach(r => { s.byType[r.accidentType || "Unknown"] = (s.byType[r.accidentType || "Unknown"] || 0) + 1; s.byWeather[r.weather || "Unknown"] = (s.byWeather[r.weather || "Unknown"] || 0) + 1; s.byRoad[r.roadCondition || "Unknown"] = (s.byRoad[r.roadCondition || "Unknown"] || 0) + 1; });
-  return c.json({ period, startDate, endDate, stats: s, reports: rp });
-});
+// ============ PERIOD REPORTS ============
+app.get("/api/reports/period/:period", authMiddleware,
+  async (c) => {
+    const period = c.req.param("period");
+    const now = new Date();
+    let startDate, endDate;
 
-app.get("/api/reports/custom-range", authMiddleware, async (c) => {
-  const start = c.req.query("start"), end = c.req.query("end");
-  if (!start || !end) return c.json({ error: "Start and end dates required" }, 400);
-  const rp = await db.select().from(reports).where(and(gte(reports.date, start), lte(reports.date, end))).orderBy(desc(reports.date));
-  const s = { total: rp.length, minor: rp.filter(r => r.severity === "minor").length, moderate: rp.filter(r => r.severity === "moderate").length, serious: rp.filter(r => r.severity === "serious").length, fatal: rp.filter(r => r.severity === "fatal").length, byType: {}, byWeather: {} };
-  rp.forEach(r => { s.byType[r.accidentType || "Unknown"] = (s.byType[r.accidentType || "Unknown"] || 0) + 1; s.byWeather[r.weather || "Unknown"] = (s.byWeather[r.weather || "Unknown"] || 0) + 1; });
-  return c.json({ startDate: start, endDate: end, stats: s, reports: rp });
-});
+    switch (period) {
+      case "daily":
+        startDate = endDate = now.toISOString().slice(0, 10);
+        break;
+      case "weekly": {
+        const d = new Date(now);
+        d.setDate(d.getDate() - 7);
+        startDate = d.toISOString().slice(0, 10);
+        endDate = now.toISOString().slice(0, 10);
+        break;
+      }
+      case "monthly":
+        startDate = now.toISOString().slice(0, 8) + "01";
+        endDate = now.toISOString().slice(0, 10);
+        break;
+      case "quarterly": {
+        const q = Math.floor(now.getMonth() / 3);
+        startDate = now.getFullYear() + "-"
+          + String(q * 3 + 1).padStart(2, "0") + "-01";
+        endDate = now.toISOString().slice(0, 10);
+        break;
+      }
+      case "yearly":
+        startDate = now.getFullYear() + "-01-01";
+        endDate = now.toISOString().slice(0, 10);
+        break;
+      default:
+        return c.json({ error: "Invalid period" }, 400);
+    }
 
-// ==================== DASHBOARD STATS ====================
-app.get("/api/dashboard
+    const rp = await db.select().from(reports).where(
+      and(
+        gte(reports.date, startDate),
+        lte(reports.date, endDate)
+      )
+    ).orderBy(desc(reports.date));
+
+    const stats = {
+      total: rp.length,
+      minor: rp.filter(r => r.severity === "minor").length,
+      moderate: rp.filter(r => r.severity === "moderate").length,
+      serious: rp.filter(r => r.severity === "serious").length,
+      fatal: rp.filter(r => r.severity === "fatal").length,
+      byType: {},
+      byWeather: {},
+      byRoad: {},
+    };
+
+    rp.forEach(r => {
+      const t = r.accidentType || "Unknown";
+      const w = r.weather || "Unknown";
+      const rd = r.roadCondition || "Unknown";
+      stats.byType[t] = (stats.byType[t] || 0) + 1;
+      stats.byWeather[w] = (stats.byWeather[w] || 0) + 1;
+      stats.byRoad[rd] = (stats.byRoad[rd] || 0) + 1;
+    });
+
+    return c.json({ period, startDate, endDate, stats, reports: rp });
+  }
+);
+
+app.get("/api/reports/custom-range", authMiddleware,
+  async (c) => {
+    const start = c.req.query("start");
+    const end = c.req.query("end");
+    if (!start || !end) {
+      return c.json({ error: "Start and end dates required" }, 400);
+    }
+
+    const rp = await db.select().from(reports).where(
+      and(gte(reports.date, start), lte(reports.date, end))
+    ).orderBy(desc(reports.date));
+
+    const stats = {
+      total: rp.length,
+      minor: rp.filter(r => r.severity === "minor").length,
+      moderate: rp.filter(r => r.severity === "moderate").length,
+      serious: rp.filter(r => r.severity === "serious").length,
+      fatal: rp.filter(r => r.severity === "fatal").length,
+      byType: {},
+      byWeather: {},
+    };
+
+    rp.forEach(r => {
+      const t = r.accidentType || "Unknown";
+      const w = r.weather || "Unknown";
+      stats.byType[t] = (stats.byType[t] || 0) + 1;
+      stats.byWeather[w] = (stats.byWeather[w] || 0) + 1;
+    });
+
+    return c.json({ startDate: start, endDate: end, stats, reports: rp });
+  }
+);
+
+// ============ DASHBOARD STATS ============
+app.get("/api/dashboard/stats", authMiddleware, async (c) => {
+  const all = await db.select().from(reports);
+  const off = await db.select().from(officers);
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+  const weekAgo = new Date(now);
+  weekAgo.setDate(weekAgo.getDate() - 7);
+  const weekAgoStr = weekAgo.toISOS
